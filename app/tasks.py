@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime, timedelta
@@ -27,6 +28,24 @@ _RE_EMAIL  = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _RE_URL    = re.compile(r"^https?://", re.IGNORECASE)
 _RE_DOMAIN = re.compile(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$")
 
+# STIX2 pattern extractor: [domain-name:value = 'evil.com']
+# Captures the object type and the quoted value
+_RE_STIX_PATTERN = re.compile(
+    r"\[([\w-]+):[\w.]+ = '([^']+)'\]",
+    re.IGNORECASE
+)
+
+# Maps STIX2 object types to ThreatNexus ioc_type
+_STIX_TYPE_MAP = {
+    "domain-name":        "domain",
+    "ipv4-addr":          "ip",
+    "ipv6-addr":          "ipv6",
+    "url":                "url",
+    "email-addr":         "email",
+    "file":               "hash",
+    "network-traffic":    "ip",
+}
+
 
 def detect_ioc_type(value: str) -> str:
     """
@@ -47,6 +66,42 @@ def detect_ioc_type(value: str) -> str:
     if _RE_URL.match(v):    return "url"
     if _RE_DOMAIN.match(v): return "domain"
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# STIX2 PARSER HELPER
+# Parses a STIX2 Bundle object and returns a list of (value, ioc_type) tuples.
+# Handles both STIX 2.0 and 2.1 indicator pattern syntax.
+# ---------------------------------------------------------------------------
+
+def parse_stix2_bundle(data: dict) -> list[tuple[str, str]]:
+    """
+    Extracts IOC (value, type) pairs from a STIX2 bundle.
+    Processes objects of type 'indicator' only.
+    Falls back to detect_ioc_type() for unrecognized STIX object types.
+    """
+    results = []
+    objects = data.get("objects", [])
+
+    for obj in objects:
+        if obj.get("type") != "indicator":
+            continue
+        pattern = obj.get("pattern", "")
+        match = _RE_STIX_PATTERN.search(pattern)
+        if not match:
+            continue
+
+        stix_obj_type = match.group(1).lower()   # e.g. 'domain-name'
+        ioc_value     = match.group(2).strip()    # e.g. 'evil.com'
+        ioc_type      = _STIX_TYPE_MAP.get(stix_obj_type, None)
+
+        # If STIX type is not in our map, fall back to regex auto-detection
+        if ioc_type is None:
+            ioc_type = detect_ioc_type(ioc_value)
+
+        results.append((ioc_value, ioc_type))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +134,17 @@ def perform_bulk_upsert(db: Session, ioc_data_list: list):
 def execute_miner(self, miner_id: int):
     """
     Celery task to fetch IOCs from a configured source URL.
-    Supports CSV and TXT parsers.
+
+    Supported parsers:
+      - txt:   Plain text list, one IOC per line. Skips lines starting with # or //
+      - csv:   Comma-separated values. IOC extracted from the first column.
+      - json:  JSON response. Requires 'json_path' (dot-notation key to the array)
+               and 'json_field' (key of the IOC value inside each object).
+               Example config: { "json_path": "data", "json_field": "indicator" }
+               If json_path is empty, the root of the response is treated as the array.
+      - stix2: STIX 2.x Bundle JSON. Extracts indicators from 'indicator' type objects.
+               Parses the 'pattern' field automatically. No extra config needed.
+
     Supports Basic Auth and Bearer Token authentication.
     Auto-classifies each IOC type using detect_ioc_type().
     Unrecognized IOCs are saved with ioc_type='unknown' and confidence=0.
@@ -117,28 +182,29 @@ def execute_miner(self, miner_id: int):
         ioc_batch = []
         type_counts = {}
 
-        def build_ioc_entry(raw_value: str) -> dict | None:
+        def build_ioc_entry(raw_value: str, forced_type: str = None) -> dict | None:
             """
             Validates, auto-classifies and builds a single IOC dict.
+            If forced_type is provided (e.g. from STIX2 parser), skip auto-detection.
             No fallback: unknown values are saved with ioc_type='unknown', confidence=0.
             """
             value = raw_value.strip()
             if not value:
                 return None
-            detected = detect_ioc_type(value)
+            detected = forced_type if forced_type else detect_ioc_type(value)
             type_counts[detected] = type_counts.get(detected, 0) + 1
             return {
                 "value": value,
                 "ioc_type": detected,
-                # Unknown IOCs get confidence=0 so they are excluded from feeds
-                # until manually reclassified via PATCH /api/v1/iocs/reclassify
                 "confidence": 0 if detected == "unknown" else 50,
                 "expire_at": expire_date,
                 "source_node_id": miner.id,
                 "last_seen": datetime.utcnow(),
             }
 
+        # ------------------------------------------------------------------
         # CSV Parser
+        # ------------------------------------------------------------------
         if parser_type == "csv":
             for line in response.text.splitlines():
                 if line.startswith("#") or not line.strip():
@@ -151,7 +217,9 @@ def execute_miner(self, miner_id: int):
                     perform_bulk_upsert(db, ioc_batch)
                     ioc_batch = []
 
-        # TXT (Plain Text List) Parser
+        # ------------------------------------------------------------------
+        # TXT Parser
+        # ------------------------------------------------------------------
         elif parser_type == "txt":
             for line in response.text.splitlines():
                 if not line.strip() or line.strip().startswith("#") or line.strip().startswith("//"):
@@ -162,6 +230,87 @@ def execute_miner(self, miner_id: int):
                 if len(ioc_batch) >= 1000:
                     perform_bulk_upsert(db, ioc_batch)
                     ioc_batch = []
+
+        # ------------------------------------------------------------------
+        # JSON Parser
+        # Requires config:
+        #   json_path  (str): dot-notation path to the array, e.g. "data.indicators"
+        #                     Leave empty if the root is already the array.
+        #   json_field (str): key of the IOC value in each object, e.g. "value"
+        #                     Leave empty if each element is a plain string.
+        # ------------------------------------------------------------------
+        elif parser_type == "json":
+            json_path  = config.get("json_path", "")   # e.g. "data" or "results.indicators"
+            json_field = config.get("json_field", "")  # e.g. "value" or "indicator"
+
+            data = response.json()
+
+            # Navigate to the target array using dot-notation path
+            if json_path:
+                for key in json_path.split("."):
+                    if isinstance(data, dict):
+                        data = data.get(key, [])
+                    else:
+                        data = []
+                        break
+
+            if not isinstance(data, list):
+                raise ValueError(
+                    f"JSON parser: expected a list at path '{json_path}', "
+                    f"got {type(data).__name__}. Check 'json_path' config."
+                )
+
+            for item in data:
+                if isinstance(item, str):
+                    # Each element is already a plain string IOC
+                    raw = item
+                elif isinstance(item, dict):
+                    if not json_field:
+                        raise ValueError(
+                            "JSON parser: response contains objects but 'json_field' "
+                            "is not configured. Set it to the key containing the IOC value."
+                        )
+                    raw = item.get(json_field, "")
+                else:
+                    continue
+
+                entry = build_ioc_entry(str(raw))
+                if entry:
+                    ioc_batch.append(entry)
+                if len(ioc_batch) >= 1000:
+                    perform_bulk_upsert(db, ioc_batch)
+                    ioc_batch = []
+
+        # ------------------------------------------------------------------
+        # STIX2 Parser
+        # Parses STIX 2.x Bundle JSON.
+        # Extracts 'indicator' objects and decodes their 'pattern' field.
+        # No extra config required beyond url + auth.
+        # ------------------------------------------------------------------
+        elif parser_type == "stix2":
+            data = response.json()
+
+            if data.get("type") != "bundle":
+                raise ValueError(
+                    f"STIX2 parser: expected a STIX Bundle (type='bundle'), "
+                    f"got type='{data.get('type')}'. Verify the source URL."
+                )
+
+            extracted = parse_stix2_bundle(data)
+
+            for ioc_value, ioc_type in extracted:
+                entry = build_ioc_entry(ioc_value, forced_type=ioc_type)
+                if entry:
+                    ioc_batch.append(entry)
+                if len(ioc_batch) >= 1000:
+                    perform_bulk_upsert(db, ioc_batch)
+                    ioc_batch = []
+
+        else:
+            raise ValueError(
+                f"Unknown parser type '{parser_type}'. "
+                f"Supported parsers: txt, csv, json, stix2."
+            )
 
         perform_bulk_upsert(db, ioc_batch)  # Final flush
         miner.last_run = datetime.utcnow()
