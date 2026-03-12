@@ -1,8 +1,10 @@
 import json
 from datetime import datetime
+from typing import List
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .database import engine, Base, get_db
@@ -119,14 +121,66 @@ def get_node_logs(node_id: int, limit: int = 15, db: Session = Depends(get_db)):
 
 @app.get("/api/v1/nodes/{node_id}/iocs")
 def get_node_iocs(node_id: int, limit: int = 50, db: Session = Depends(get_db)):
+    """Returns classified IOCs (excludes unknown) for a given node."""
     iocs = (
         db.query(IndicatorDB)
-        .filter(IndicatorDB.source_node_id == node_id)
+        .filter(
+            IndicatorDB.source_node_id == node_id,
+            IndicatorDB.ioc_type != "unknown",
+        )
         .order_by(IndicatorDB.id.desc())
         .limit(limit)
         .all()
     )
-    return [{"value": ioc.value, "type": ioc.ioc_type, "confidence": ioc.confidence} for ioc in iocs]
+    return [{"id": ioc.id, "value": ioc.value, "type": ioc.ioc_type, "confidence": ioc.confidence} for ioc in iocs]
+
+
+@app.get("/api/v1/nodes/{node_id}/iocs/unknown")
+def get_unknown_iocs(node_id: int, db: Session = Depends(get_db)):
+    """Returns all unclassified IOCs (ioc_type='unknown') for a given Miner node."""
+    iocs = (
+        db.query(IndicatorDB)
+        .filter(
+            IndicatorDB.source_node_id == node_id,
+            IndicatorDB.ioc_type == "unknown",
+        )
+        .order_by(IndicatorDB.id.desc())
+        .all()
+    )
+    return [{"id": ioc.id, "value": ioc.value} for ioc in iocs]
+
+
+# ---------------------------------------------------------------------------
+# IOC MANUAL RECLASSIFICATION
+# ---------------------------------------------------------------------------
+
+VALID_IOC_TYPES = {"ip", "ipv6", "domain", "url", "hash", "email"}
+
+
+class IocTypeUpdate(BaseModel):
+    ioc_ids: List[int]
+    ioc_type: str
+
+
+@app.patch("/api/v1/iocs/reclassify")
+def reclassify_iocs(payload: IocTypeUpdate, db: Session = Depends(get_db)):
+    """
+    Manually reclassify one or more IOCs from 'unknown' to a valid type.
+    Sets confidence to 50 (standard) after manual classification.
+    """
+    if payload.ioc_type not in VALID_IOC_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid type '{payload.ioc_type}'. Valid types: {sorted(VALID_IOC_TYPES)}"
+        )
+    updated = db.query(IndicatorDB).filter(IndicatorDB.id.in_(payload.ioc_ids)).all()
+    if not updated:
+        raise HTTPException(status_code=404, detail="No IOCs found with the provided IDs")
+    for ioc in updated:
+        ioc.ioc_type = payload.ioc_type
+        ioc.confidence = 50  # Restore standard confidence after manual review
+    db.commit()
+    return {"message": f"{len(updated)} IOC(s) reclassified as '{payload.ioc_type}'"}
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +209,7 @@ def get_dynamic_feed(
     """
     Retrieves active IOCs for a named Output node.
     Traverses the graph: Output <- Aggregator <- Miners to resolve IOC sources.
+    Excludes IOCs with ioc_type='unknown' or confidence=0.
     Supports 'txt' (Palo Alto EDL) and 'json' output formats.
     """
     output_node = db.query(NodeConfig).filter(
@@ -183,6 +238,7 @@ def get_dynamic_feed(
         db.query(IndicatorDB)
         .filter(
             IndicatorDB.source_node_id.in_(miner_ids),
+            IndicatorDB.ioc_type != "unknown",  # Always exclude unclassified
             IndicatorDB.confidence >= min_confidence,
             IndicatorDB.expire_at > datetime.utcnow(),
         )

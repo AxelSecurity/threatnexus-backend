@@ -17,7 +17,7 @@ celery_app = Celery("threatnexus", broker=REDIS_URL, backend=REDIS_URL)
 # ---------------------------------------------------------------------------
 # IOC AUTO-CLASSIFIER
 # Regex patterns ordered from most specific to least specific.
-# The user-configured ioc_type is used only as a fallback for 'unknown' values.
+# No fallback: unrecognized values are saved as 'unknown' with confidence=0.
 # ---------------------------------------------------------------------------
 
 _RE_HASH   = re.compile(r"^[a-fA-F0-9]{32}$|^[a-fA-F0-9]{40}$|^[a-fA-F0-9]{64}$")
@@ -37,6 +37,7 @@ def detect_ioc_type(value: str) -> str:
     - Hashes before IPs (a hex string could match both patterns)
     - Email before domain (emails contain a domain part)
     - URL before domain (URLs start with http/https)
+    Returns 'unknown' when no pattern matches.
     """
     v = value.strip()
     if _RE_HASH.match(v):   return "hash"
@@ -63,7 +64,7 @@ def perform_bulk_upsert(db: Session, ioc_data_list: list):
             "last_seen": stmt.excluded.last_seen,
             "expire_at": stmt.excluded.expire_at,
             "confidence": stmt.excluded.confidence,
-            "ioc_type": stmt.excluded.ioc_type,  # Update type on conflict too
+            "ioc_type": stmt.excluded.ioc_type,
         },
     )
     db.execute(stmt)
@@ -81,6 +82,7 @@ def execute_miner(self, miner_id: int):
     Supports CSV and TXT parsers.
     Supports Basic Auth and Bearer Token authentication.
     Auto-classifies each IOC type using detect_ioc_type().
+    Unrecognized IOCs are saved with ioc_type='unknown' and confidence=0.
     On completion, triggers downstream Aggregator nodes (Event-Driven Chain).
     """
     db = SessionLocal()
@@ -97,8 +99,6 @@ def execute_miner(self, miner_id: int):
         config = miner.config
         url = config.get("url")
         parser_type = config.get("parser", "txt")
-        # Fallback type used only when auto-detection returns 'unknown'
-        ioc_type_fallback = config.get("ioc_type", "ip")
 
         # Authentication handling
         auth_type = config.get("auth_type", "none")
@@ -110,31 +110,29 @@ def execute_miner(self, miner_id: int):
         elif auth_type == "bearer":
             req_kwargs["headers"] = {"Authorization": f"Bearer {config.get('auth_token', '')}"}
 
-        expire_date = datetime.utcnow() + timedelta(days=30)  # Default TTL pre-aggregation
+        expire_date = datetime.utcnow() + timedelta(days=30)
 
         response = requests.get(url, **req_kwargs)
         response.raise_for_status()
         ioc_batch = []
-
-        # Counters for log summary
         type_counts = {}
-        unknown_count = 0
 
         def build_ioc_entry(raw_value: str) -> dict | None:
-            """Validates, classifies and builds a single IOC dict."""
+            """
+            Validates, auto-classifies and builds a single IOC dict.
+            No fallback: unknown values are saved with ioc_type='unknown', confidence=0.
+            """
             value = raw_value.strip()
             if not value:
                 return None
             detected = detect_ioc_type(value)
-            final_type = detected if detected != "unknown" else ioc_type_fallback
-            if detected == "unknown":
-                nonlocal unknown_count
-                unknown_count += 1
-            type_counts[final_type] = type_counts.get(final_type, 0) + 1
+            type_counts[detected] = type_counts.get(detected, 0) + 1
             return {
                 "value": value,
-                "ioc_type": final_type,
-                "confidence": 50,
+                "ioc_type": detected,
+                # Unknown IOCs get confidence=0 so they are excluded from feeds
+                # until manually reclassified via PATCH /api/v1/iocs/reclassify
+                "confidence": 0 if detected == "unknown" else 50,
                 "expire_at": expire_date,
                 "source_node_id": miner.id,
                 "last_seen": datetime.utcnow(),
@@ -169,14 +167,16 @@ def execute_miner(self, miner_id: int):
         miner.last_run = datetime.utcnow()
 
         # Build detailed log message with type breakdown
+        total = sum(type_counts.values())
+        unknown_count = type_counts.get("unknown", 0)
         type_summary = ", ".join(f"{k}: {v}" for k, v in type_counts.items())
-        log_msg = f"Fetch completed. Total: {sum(type_counts.values())} IOCs. Types: [{type_summary}]."
-        if unknown_count:
-            log_msg += f" Fallback to '{ioc_type_fallback}' for {unknown_count} unrecognized values."
+        log_msg = f"Fetch completed. Total: {total} IOCs. Types: [{type_summary}]."
+        if unknown_count > 0:
+            log_msg += f" WARNING: {unknown_count} unclassified IOCs require manual review."
 
         run_log.status = "success"
         run_log.message = log_msg
-        run_log.iocs_processed = sum(type_counts.values())
+        run_log.iocs_processed = total
         db.commit()
 
         # EVENT-DRIVEN CASCADE: Trigger connected Aggregators
@@ -190,7 +190,7 @@ def execute_miner(self, miner_id: int):
             if agg:
                 execute_aggregator.delay(agg.id)
 
-        return {"status": "success", "miner": miner.name, "processed": run_log.iocs_processed, "types": type_counts}
+        return {"status": "success", "miner": miner.name, "processed": total, "types": type_counts}
 
     except Exception as e:
         db.rollback()
@@ -218,6 +218,7 @@ def execute_aggregator(self, aggregator_id: int):
     """
     Celery task triggered automatically by Miners (Event-Driven Chain).
     Applies whitelist filtering, confidence override and aging (TTL) to IOCs.
+    IOCs with ioc_type='unknown' are skipped (confidence=0, excluded from feeds).
     """
     db = SessionLocal()
     try:
@@ -232,7 +233,6 @@ def execute_aggregator(self, aggregator_id: int):
         db.commit()
         db.refresh(run_log)
 
-        # Find parent Miners (source_id -> this aggregator as target_id)
         edges_in = db.query(NodeEdge).filter(NodeEdge.target_id == aggregator_id).all()
         miner_ids = [edge.source_id for edge in edges_in]
 
@@ -247,23 +247,22 @@ def execute_aggregator(self, aggregator_id: int):
         days_to_live = config.get("days_to_live", 30)
         whitelist_domains = config.get("whitelist", [])
 
+        # Exclude 'unknown' IOCs - they require manual reclassification first
         iocs_to_process = db.query(IndicatorDB).filter(
-            IndicatorDB.source_node_id.in_(miner_ids)
+            IndicatorDB.source_node_id.in_(miner_ids),
+            IndicatorDB.ioc_type != "unknown",
         ).all()
 
         processed_count = 0
         dropped_count = 0
 
         for ioc in iocs_to_process:
-            # Whitelist check
             if any(wl in ioc.value for wl in whitelist_domains):
                 db.delete(ioc)
                 dropped_count += 1
                 continue
-            # Apply confidence override
             if confidence_override:
                 ioc.confidence = confidence_override
-            # Apply aging (TTL)
             ioc.expire_at = datetime.utcnow() + timedelta(days=days_to_live)
             processed_count += 1
 
