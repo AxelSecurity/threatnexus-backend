@@ -68,6 +68,9 @@ def parse_stix2_bundle(data: dict) -> list[tuple[str, str]]:
 
 # ---------------------------------------------------------------------------
 # BULK UPSERT
+# Uses the composite constraint uq_indicator_value_per_node (value, source_node_id).
+# This allows the same IOC value to coexist in different nodes (Miner + Whitelist).
+# On conflict: refresh last_seen, expire_at, confidence, ioc_type — never change source.
 # ---------------------------------------------------------------------------
 
 def perform_bulk_upsert(db: Session, ioc_data_list: list):
@@ -75,7 +78,7 @@ def perform_bulk_upsert(db: Session, ioc_data_list: list):
         return
     stmt = insert(IndicatorDB).values(ioc_data_list)
     stmt = stmt.on_conflict_do_update(
-        index_elements=["value"],
+        constraint="uq_indicator_value_per_node",
         set_={
             "last_seen":  stmt.excluded.last_seen,
             "expire_at":  stmt.excluded.expire_at,
@@ -97,7 +100,6 @@ def execute_miner(self, miner_id: int):
     Fetches IOCs from a remote source and persists them.
     Supported parsers: txt, csv, json, stix2.
     Triggers connected Aggregators on completion (Event-Driven Chain).
-    Also triggers connected Aggregators where this Miner acts as Whitelist source.
     """
     db = SessionLocal()
     try:
@@ -127,7 +129,7 @@ def execute_miner(self, miner_id: int):
         response    = requests.get(url, **req_kwargs)
         response.raise_for_status()
 
-        ioc_batch  = []
+        ioc_batch   = []
         type_counts = {}
 
         def build_ioc_entry(raw_value: str, forced_type: str = None) -> dict | None:
@@ -209,16 +211,16 @@ def execute_miner(self, miner_id: int):
         if unknown_count > 0:
             log_msg += f" WARNING: {unknown_count} unclassified IOCs require manual review."
 
-        run_log.status        = "success"
-        run_log.message       = log_msg
+        run_log.status         = "success"
+        run_log.message        = log_msg
         run_log.iocs_processed = total
         db.commit()
 
-        # Trigger all connected Aggregators (normal + whitelist edges)
+        # Trigger all connected Aggregators (event-driven)
         edges_out = db.query(NodeEdge).filter(NodeEdge.source_id == miner.id).all()
         for edge in edges_out:
             agg = db.query(NodeConfig).filter(
-                NodeConfig.id == edge.target_id,
+                NodeConfig.id        == edge.target_id,
                 NodeConfig.node_type == "aggregator",
                 NodeConfig.is_active == True,
             ).first()
@@ -242,37 +244,18 @@ def execute_miner(self, miner_id: int):
 
 
 # ---------------------------------------------------------------------------
-# AGGREGATOR TASK  (full rewrite)
+# AGGREGATOR TASK
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True)
 def execute_aggregator(self, aggregator_id: int):
     """
     Full Aggregator pipeline:
-
-    1. Load config:
-         - ioc_types       (list[str])  : IOC types to process, e.g. ["domain", "ip"].
-                                          Empty list = process all types.
-         - days_to_live    (int)        : TTL in days applied to every processed IOC.
-         - confidence_override (int|None): If set, overrides confidence of all IOCs.
-
-    2. Resolve connected nodes via edges:
-         - Regular Miners  (node_type = "miner")     → source of IOCs to process.
-         - Whitelist Miners (node_type = "whitelist") → source of IOC values to exclude.
-
-    3. Build whitelist set from all Whitelist Miner IOCs.
-
-    4. Query IOCs from regular Miners:
-         - Filter by ioc_types (if configured).
-         - Exclude unknown IOCs (confidence = 0).
-
-    5. For each IOC:
-         - Skip if value is in the whitelist set.
-         - Apply confidence_override if set.
-         - Update expire_at = now + days_to_live.
-
-    6. Write detailed log with counts: processed, skipped (type filter),
-       dropped (whitelist), expired (age-out stats available via cleanup task).
+    1. Resolve Miners and Whitelist Miners connected via edges.
+    2. Build whitelist exclusion set (case-insensitive).
+    3. Query IOCs from regular Miners, apply ioc_types filter.
+    4. Skip whitelisted IOCs, apply TTL + confidence override to the rest.
+    5. Log: processed, dropped (whitelist), TTL applied.
     """
     db = SessionLocal()
     try:
@@ -289,12 +272,11 @@ def execute_aggregator(self, aggregator_id: int):
         db.commit()
         db.refresh(run_log)
 
-        config               = aggregator.config
-        ioc_types            = config.get("ioc_types", [])        # e.g. ["domain", "ip"]
-        days_to_live         = int(config.get("days_to_live", 30))
-        confidence_override  = config.get("confidence_override", None)
+        config              = aggregator.config
+        ioc_types           = config.get("ioc_types", [])
+        days_to_live        = int(config.get("days_to_live", 30))
+        confidence_override = config.get("confidence_override", None)
 
-        # ── Resolve connected nodes ────────────────────────────────────────
         edges_in = db.query(NodeEdge).filter(NodeEdge.target_id == aggregator_id).all()
         if not edges_in:
             run_log.status  = "error"
@@ -304,7 +286,6 @@ def execute_aggregator(self, aggregator_id: int):
 
         miner_ids     = []
         whitelist_ids = []
-
         for edge in edges_in:
             source = db.query(NodeConfig).filter(NodeConfig.id == edge.source_id).first()
             if not source:
@@ -320,9 +301,7 @@ def execute_aggregator(self, aggregator_id: int):
             db.commit()
             return {"status": "error"}
 
-        # ── Build whitelist set ────────────────────────────────────────────
-        # Load all IOC values from connected Whitelist Miners.
-        # Case-insensitive matching: store lowercase.
+        # Build whitelist exclusion set (case-insensitive)
         whitelist_set = set()
         if whitelist_ids:
             wl_iocs = db.query(IndicatorDB.value).filter(
@@ -330,40 +309,27 @@ def execute_aggregator(self, aggregator_id: int):
             ).all()
             whitelist_set = {row.value.strip().lower() for row in wl_iocs}
 
-        # ── Query IOCs from regular Miners ────────────────────────────────
         ioc_query = db.query(IndicatorDB).filter(
             IndicatorDB.source_node_id.in_(miner_ids),
             IndicatorDB.ioc_type != "unknown",
         )
-
-        # Apply ioc_types filter (if configured)
         if ioc_types:
-            # Validate: silently ignore invalid type strings
             valid_filter = [t for t in ioc_types if t in VALID_IOC_TYPES]
             if valid_filter:
                 ioc_query = ioc_query.filter(IndicatorDB.ioc_type.in_(valid_filter))
 
-        iocs_to_process = ioc_query.all()
-
-        # ── Process IOCs ──────────────────────────────────────────────────
-        processed_count    = 0
-        dropped_whitelist  = 0
-        skipped_type       = 0   # already filtered by SQL, kept for clarity
-        new_expire         = datetime.utcnow() + timedelta(days=days_to_live)
+        iocs_to_process   = ioc_query.all()
+        processed_count   = 0
+        dropped_whitelist = 0
+        new_expire        = datetime.utcnow() + timedelta(days=days_to_live)
 
         for ioc in iocs_to_process:
-            # Whitelist check (case-insensitive)
             if ioc.value.strip().lower() in whitelist_set:
                 dropped_whitelist += 1
                 continue
-
-            # Apply aging
             ioc.expire_at = new_expire
-
-            # Apply confidence override
             if confidence_override is not None:
                 ioc.confidence = int(confidence_override)
-
             processed_count += 1
 
         db.commit()
@@ -378,7 +344,6 @@ def execute_aggregator(self, aggregator_id: int):
             f"Dropped (Whitelist): {dropped_whitelist}. "
             f"TTL applied: {days_to_live} days."
         )
-
         run_log.status         = "success"
         run_log.message        = log_msg
         run_log.iocs_processed = processed_count
@@ -406,27 +371,18 @@ def execute_aggregator(self, aggregator_id: int):
 
 
 # ---------------------------------------------------------------------------
-# AGE-OUT CLEANUP TASK
-# Runs every hour via Celery Beat.
-# Deletes all IOCs whose expire_at timestamp is in the past.
+# AGE-OUT CLEANUP TASK — runs every hour
 # ---------------------------------------------------------------------------
 
 @celery_app.task
 def cleanup_expired_iocs():
-    """
-    Hourly age-out task.
-    Permanently removes all IndicatorDB rows with expire_at < now.
-    Logs a summary entry for each Aggregator whose IOCs were affected.
-    """
     db = SessionLocal()
     try:
         now     = datetime.utcnow()
         expired = db.query(IndicatorDB).filter(IndicatorDB.expire_at < now).all()
         count   = len(expired)
-
         for ioc in expired:
             db.delete(ioc)
-
         db.commit()
         return {"status": "success", "expired_deleted": count}
     except Exception as e:
@@ -437,16 +393,11 @@ def cleanup_expired_iocs():
 
 
 # ---------------------------------------------------------------------------
-# MASTER SCHEDULER TASK
+# MASTER SCHEDULER — runs every minute
 # ---------------------------------------------------------------------------
 
 @celery_app.task
 def master_scheduler_task():
-    """
-    Runs every minute via Celery Beat.
-    Triggers active Miners that are due based on polling_interval (minutes).
-    Aggregators are triggered by Miners (Event-Driven), not by this scheduler.
-    """
     db = SessionLocal()
     try:
         now    = datetime.utcnow()
@@ -473,7 +424,7 @@ celery_app.conf.beat_schedule = {
     },
     "cleanup-expired-iocs-every-hour": {
         "task":     "app.tasks.cleanup_expired_iocs",
-        "schedule": crontab(minute="0"),   # top of every hour
+        "schedule": crontab(minute="0"),
     },
 }
 celery_app.conf.timezone = "UTC"
