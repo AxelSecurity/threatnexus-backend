@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime, timedelta
@@ -13,6 +14,44 @@ REDIS_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 celery_app = Celery("threatnexus", broker=REDIS_URL, backend=REDIS_URL)
 
 
+# ---------------------------------------------------------------------------
+# IOC AUTO-CLASSIFIER
+# Regex patterns ordered from most specific to least specific.
+# The user-configured ioc_type is used only as a fallback for 'unknown' values.
+# ---------------------------------------------------------------------------
+
+_RE_HASH   = re.compile(r"^[a-fA-F0-9]{32}$|^[a-fA-F0-9]{40}$|^[a-fA-F0-9]{64}$")
+_RE_IPV4   = re.compile(r"^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$")
+_RE_IPV6   = re.compile(r"^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$")
+_RE_EMAIL  = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_RE_URL    = re.compile(r"^https?://", re.IGNORECASE)
+_RE_DOMAIN = re.compile(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$")
+
+
+def detect_ioc_type(value: str) -> str:
+    """
+    Auto-classifies an IOC string into one of the following types:
+    hash, ip, ipv6, email, url, domain, unknown.
+
+    Order of checks is intentional:
+    - Hashes before IPs (a hex string could match both patterns)
+    - Email before domain (emails contain a domain part)
+    - URL before domain (URLs start with http/https)
+    """
+    v = value.strip()
+    if _RE_HASH.match(v):   return "hash"
+    if _RE_IPV4.match(v):   return "ip"
+    if _RE_IPV6.match(v):   return "ipv6"
+    if _RE_EMAIL.match(v):  return "email"
+    if _RE_URL.match(v):    return "url"
+    if _RE_DOMAIN.match(v): return "domain"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# BULK UPSERT
+# ---------------------------------------------------------------------------
+
 def perform_bulk_upsert(db: Session, ioc_data_list: list):
     """Bulk upsert IOCs into PostgreSQL. Deduplicates on 'value' field."""
     if not ioc_data_list:
@@ -24,11 +63,16 @@ def perform_bulk_upsert(db: Session, ioc_data_list: list):
             "last_seen": stmt.excluded.last_seen,
             "expire_at": stmt.excluded.expire_at,
             "confidence": stmt.excluded.confidence,
+            "ioc_type": stmt.excluded.ioc_type,  # Update type on conflict too
         },
     )
     db.execute(stmt)
     db.commit()
 
+
+# ---------------------------------------------------------------------------
+# MINER TASK
+# ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True)
 def execute_miner(self, miner_id: int):
@@ -36,6 +80,7 @@ def execute_miner(self, miner_id: int):
     Celery task to fetch IOCs from a configured source URL.
     Supports CSV and TXT parsers.
     Supports Basic Auth and Bearer Token authentication.
+    Auto-classifies each IOC type using detect_ioc_type().
     On completion, triggers downstream Aggregator nodes (Event-Driven Chain).
     """
     db = SessionLocal()
@@ -52,7 +97,8 @@ def execute_miner(self, miner_id: int):
         config = miner.config
         url = config.get("url")
         parser_type = config.get("parser", "txt")
-        ioc_type_default = config.get("ioc_type", "ip")
+        # Fallback type used only when auto-detection returns 'unknown'
+        ioc_type_fallback = config.get("ioc_type", "ip")
 
         # Authentication handling
         auth_type = config.get("auth_type", "none")
@@ -70,16 +116,39 @@ def execute_miner(self, miner_id: int):
         response.raise_for_status()
         ioc_batch = []
 
+        # Counters for log summary
+        type_counts = {}
+        unknown_count = 0
+
+        def build_ioc_entry(raw_value: str) -> dict | None:
+            """Validates, classifies and builds a single IOC dict."""
+            value = raw_value.strip()
+            if not value:
+                return None
+            detected = detect_ioc_type(value)
+            final_type = detected if detected != "unknown" else ioc_type_fallback
+            if detected == "unknown":
+                nonlocal unknown_count
+                unknown_count += 1
+            type_counts[final_type] = type_counts.get(final_type, 0) + 1
+            return {
+                "value": value,
+                "ioc_type": final_type,
+                "confidence": 50,
+                "expire_at": expire_date,
+                "source_node_id": miner.id,
+                "last_seen": datetime.utcnow(),
+            }
+
         # CSV Parser
         if parser_type == "csv":
             for line in response.text.splitlines():
                 if line.startswith("#") or not line.strip():
                     continue
-                value = line.split(",")[0].replace('"', "") if "," in line else line.strip()
-                ioc_batch.append({
-                    "value": value, "ioc_type": ioc_type_default, "confidence": 50,
-                    "expire_at": expire_date, "source_node_id": miner.id, "last_seen": datetime.utcnow(),
-                })
+                raw = line.split(",")[0].replace('"', "") if "," in line else line.strip()
+                entry = build_ioc_entry(raw)
+                if entry:
+                    ioc_batch.append(entry)
                 if len(ioc_batch) >= 1000:
                     perform_bulk_upsert(db, ioc_batch)
                     ioc_batch = []
@@ -87,13 +156,11 @@ def execute_miner(self, miner_id: int):
         # TXT (Plain Text List) Parser
         elif parser_type == "txt":
             for line in response.text.splitlines():
-                clean_line = line.strip()
-                if not clean_line or clean_line.startswith("#") or clean_line.startswith("//"):
+                if not line.strip() or line.strip().startswith("#") or line.strip().startswith("//"):
                     continue
-                ioc_batch.append({
-                    "value": clean_line, "ioc_type": ioc_type_default, "confidence": 50,
-                    "expire_at": expire_date, "source_node_id": miner.id, "last_seen": datetime.utcnow(),
-                })
+                entry = build_ioc_entry(line)
+                if entry:
+                    ioc_batch.append(entry)
                 if len(ioc_batch) >= 1000:
                     perform_bulk_upsert(db, ioc_batch)
                     ioc_batch = []
@@ -101,9 +168,15 @@ def execute_miner(self, miner_id: int):
         perform_bulk_upsert(db, ioc_batch)  # Final flush
         miner.last_run = datetime.utcnow()
 
+        # Build detailed log message with type breakdown
+        type_summary = ", ".join(f"{k}: {v}" for k, v in type_counts.items())
+        log_msg = f"Fetch completed. Total: {sum(type_counts.values())} IOCs. Types: [{type_summary}]."
+        if unknown_count:
+            log_msg += f" Fallback to '{ioc_type_fallback}' for {unknown_count} unrecognized values."
+
         run_log.status = "success"
-        run_log.message = "Fetch completed successfully"
-        run_log.iocs_processed = len(ioc_batch)
+        run_log.message = log_msg
+        run_log.iocs_processed = sum(type_counts.values())
         db.commit()
 
         # EVENT-DRIVEN CASCADE: Trigger connected Aggregators
@@ -117,7 +190,7 @@ def execute_miner(self, miner_id: int):
             if agg:
                 execute_aggregator.delay(agg.id)
 
-        return {"status": "success", "miner": miner.name, "processed": len(ioc_batch)}
+        return {"status": "success", "miner": miner.name, "processed": run_log.iocs_processed, "types": type_counts}
 
     except Exception as e:
         db.rollback()
@@ -135,6 +208,10 @@ def execute_miner(self, miner_id: int):
     finally:
         db.close()
 
+
+# ---------------------------------------------------------------------------
+# AGGREGATOR TASK
+# ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True)
 def execute_aggregator(self, aggregator_id: int):
@@ -219,6 +296,10 @@ def execute_aggregator(self, aggregator_id: int):
     finally:
         db.close()
 
+
+# ---------------------------------------------------------------------------
+# MASTER SCHEDULER TASK
+# ---------------------------------------------------------------------------
 
 @celery_app.task
 def master_scheduler_task():
