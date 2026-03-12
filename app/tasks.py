@@ -17,8 +17,6 @@ celery_app = Celery("threatnexus", broker=REDIS_URL, backend=REDIS_URL)
 
 # ---------------------------------------------------------------------------
 # IOC AUTO-CLASSIFIER
-# Regex patterns ordered from most specific to least specific.
-# No fallback: unrecognized values are saved as 'unknown' with confidence=0.
 # ---------------------------------------------------------------------------
 
 _RE_HASH   = re.compile(r"^[a-fA-F0-9]{32}$|^[a-fA-F0-9]{40}$|^[a-fA-F0-9]{64}$")
@@ -28,36 +26,21 @@ _RE_EMAIL  = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _RE_URL    = re.compile(r"^https?://", re.IGNORECASE)
 _RE_DOMAIN = re.compile(r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$")
 
-# STIX2 pattern extractor: [domain-name:value = 'evil.com']
-# Captures the object type and the quoted value
-_RE_STIX_PATTERN = re.compile(
-    r"\[([\w-]+):[\w.]+ = '([^']+)'\]",
-    re.IGNORECASE
-)
-
-# Maps STIX2 object types to ThreatNexus ioc_type
+_RE_STIX_PATTERN = re.compile(r"\[([\w-]+):[\w.]+ = '([^']+)'\]", re.IGNORECASE)
 _STIX_TYPE_MAP = {
-    "domain-name":        "domain",
-    "ipv4-addr":          "ip",
-    "ipv6-addr":          "ipv6",
-    "url":                "url",
-    "email-addr":         "email",
-    "file":               "hash",
-    "network-traffic":    "ip",
+    "domain-name":     "domain",
+    "ipv4-addr":       "ip",
+    "ipv6-addr":       "ipv6",
+    "url":             "url",
+    "email-addr":      "email",
+    "file":            "hash",
+    "network-traffic": "ip",
 }
+
+VALID_IOC_TYPES = {"ip", "ipv6", "domain", "url", "hash", "email"}
 
 
 def detect_ioc_type(value: str) -> str:
-    """
-    Auto-classifies an IOC string into one of the following types:
-    hash, ip, ipv6, email, url, domain, unknown.
-
-    Order of checks is intentional:
-    - Hashes before IPs (a hex string could match both patterns)
-    - Email before domain (emails contain a domain part)
-    - URL before domain (URLs start with http/https)
-    Returns 'unknown' when no pattern matches.
-    """
     v = value.strip()
     if _RE_HASH.match(v):   return "hash"
     if _RE_IPV4.match(v):   return "ip"
@@ -68,39 +51,18 @@ def detect_ioc_type(value: str) -> str:
     return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# STIX2 PARSER HELPER
-# Parses a STIX2 Bundle object and returns a list of (value, ioc_type) tuples.
-# Handles both STIX 2.0 and 2.1 indicator pattern syntax.
-# ---------------------------------------------------------------------------
-
 def parse_stix2_bundle(data: dict) -> list[tuple[str, str]]:
-    """
-    Extracts IOC (value, type) pairs from a STIX2 bundle.
-    Processes objects of type 'indicator' only.
-    Falls back to detect_ioc_type() for unrecognized STIX object types.
-    """
     results = []
-    objects = data.get("objects", [])
-
-    for obj in objects:
+    for obj in data.get("objects", []):
         if obj.get("type") != "indicator":
             continue
-        pattern = obj.get("pattern", "")
-        match = _RE_STIX_PATTERN.search(pattern)
+        match = _RE_STIX_PATTERN.search(obj.get("pattern", ""))
         if not match:
             continue
-
-        stix_obj_type = match.group(1).lower()   # e.g. 'domain-name'
-        ioc_value     = match.group(2).strip()    # e.g. 'evil.com'
-        ioc_type      = _STIX_TYPE_MAP.get(stix_obj_type, None)
-
-        # If STIX type is not in our map, fall back to regex auto-detection
-        if ioc_type is None:
-            ioc_type = detect_ioc_type(ioc_value)
-
+        stix_obj_type = match.group(1).lower()
+        ioc_value     = match.group(2).strip()
+        ioc_type      = _STIX_TYPE_MAP.get(stix_obj_type) or detect_ioc_type(ioc_value)
         results.append((ioc_value, ioc_type))
-
     return results
 
 
@@ -109,17 +71,16 @@ def parse_stix2_bundle(data: dict) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 def perform_bulk_upsert(db: Session, ioc_data_list: list):
-    """Bulk upsert IOCs into PostgreSQL. Deduplicates on 'value' field."""
     if not ioc_data_list:
         return
     stmt = insert(IndicatorDB).values(ioc_data_list)
     stmt = stmt.on_conflict_do_update(
         index_elements=["value"],
         set_={
-            "last_seen": stmt.excluded.last_seen,
-            "expire_at": stmt.excluded.expire_at,
+            "last_seen":  stmt.excluded.last_seen,
+            "expire_at":  stmt.excluded.expire_at,
             "confidence": stmt.excluded.confidence,
-            "ioc_type": stmt.excluded.ioc_type,
+            "ioc_type":   stmt.excluded.ioc_type,
         },
     )
     db.execute(stmt)
@@ -133,22 +94,10 @@ def perform_bulk_upsert(db: Session, ioc_data_list: list):
 @celery_app.task(bind=True)
 def execute_miner(self, miner_id: int):
     """
-    Celery task to fetch IOCs from a configured source URL.
-
-    Supported parsers:
-      - txt:   Plain text list, one IOC per line. Skips lines starting with # or //
-      - csv:   Comma-separated values. IOC extracted from the first column.
-      - json:  JSON response. Requires 'json_path' (dot-notation key to the array)
-               and 'json_field' (key of the IOC value inside each object).
-               Example config: { "json_path": "data", "json_field": "indicator" }
-               If json_path is empty, the root of the response is treated as the array.
-      - stix2: STIX 2.x Bundle JSON. Extracts indicators from 'indicator' type objects.
-               Parses the 'pattern' field automatically. No extra config needed.
-
-    Supports Basic Auth and Bearer Token authentication.
-    Auto-classifies each IOC type using detect_ioc_type().
-    Unrecognized IOCs are saved with ioc_type='unknown' and confidence=0.
-    On completion, triggers downstream Aggregator nodes (Event-Driven Chain).
+    Fetches IOCs from a remote source and persists them.
+    Supported parsers: txt, csv, json, stix2.
+    Triggers connected Aggregators on completion (Event-Driven Chain).
+    Also triggers connected Aggregators where this Miner acts as Whitelist source.
     """
     db = SessionLocal()
     try:
@@ -161,12 +110,11 @@ def execute_miner(self, miner_id: int):
         db.commit()
         db.refresh(run_log)
 
-        config = miner.config
-        url = config.get("url")
+        config      = miner.config
+        url         = config.get("url")
         parser_type = config.get("parser", "txt")
+        auth_type   = config.get("auth_type", "none")
 
-        # Authentication handling
-        auth_type = config.get("auth_type", "none")
         req_kwargs = {"timeout": 15}
         if auth_type == "basic":
             req_kwargs["auth"] = HTTPBasicAuth(
@@ -176,35 +124,27 @@ def execute_miner(self, miner_id: int):
             req_kwargs["headers"] = {"Authorization": f"Bearer {config.get('auth_token', '')}"}
 
         expire_date = datetime.utcnow() + timedelta(days=30)
-
-        response = requests.get(url, **req_kwargs)
+        response    = requests.get(url, **req_kwargs)
         response.raise_for_status()
-        ioc_batch = []
+
+        ioc_batch  = []
         type_counts = {}
 
         def build_ioc_entry(raw_value: str, forced_type: str = None) -> dict | None:
-            """
-            Validates, auto-classifies and builds a single IOC dict.
-            If forced_type is provided (e.g. from STIX2 parser), skip auto-detection.
-            No fallback: unknown values are saved with ioc_type='unknown', confidence=0.
-            """
             value = raw_value.strip()
             if not value:
                 return None
             detected = forced_type if forced_type else detect_ioc_type(value)
             type_counts[detected] = type_counts.get(detected, 0) + 1
             return {
-                "value": value,
-                "ioc_type": detected,
-                "confidence": 0 if detected == "unknown" else 50,
-                "expire_at": expire_date,
+                "value":          value,
+                "ioc_type":       detected,
+                "confidence":     0 if detected == "unknown" else 50,
+                "expire_at":      expire_date,
                 "source_node_id": miner.id,
-                "last_seen": datetime.utcnow(),
+                "last_seen":      datetime.utcnow(),
             }
 
-        # ------------------------------------------------------------------
-        # CSV Parser
-        # ------------------------------------------------------------------
         if parser_type == "csv":
             for line in response.text.splitlines():
                 if line.startswith("#") or not line.strip():
@@ -214,121 +154,67 @@ def execute_miner(self, miner_id: int):
                 if entry:
                     ioc_batch.append(entry)
                 if len(ioc_batch) >= 1000:
-                    perform_bulk_upsert(db, ioc_batch)
-                    ioc_batch = []
+                    perform_bulk_upsert(db, ioc_batch); ioc_batch = []
 
-        # ------------------------------------------------------------------
-        # TXT Parser
-        # ------------------------------------------------------------------
         elif parser_type == "txt":
             for line in response.text.splitlines():
-                if not line.strip() or line.strip().startswith("#") or line.strip().startswith("//"):
+                if not line.strip() or line.strip().startswith(("#", "//")):
                     continue
                 entry = build_ioc_entry(line)
                 if entry:
                     ioc_batch.append(entry)
                 if len(ioc_batch) >= 1000:
-                    perform_bulk_upsert(db, ioc_batch)
-                    ioc_batch = []
+                    perform_bulk_upsert(db, ioc_batch); ioc_batch = []
 
-        # ------------------------------------------------------------------
-        # JSON Parser
-        # Requires config:
-        #   json_path  (str): dot-notation path to the array, e.g. "data.indicators"
-        #                     Leave empty if the root is already the array.
-        #   json_field (str): key of the IOC value in each object, e.g. "value"
-        #                     Leave empty if each element is a plain string.
-        # ------------------------------------------------------------------
         elif parser_type == "json":
-            json_path  = config.get("json_path", "")   # e.g. "data" or "results.indicators"
-            json_field = config.get("json_field", "")  # e.g. "value" or "indicator"
-
+            json_path  = config.get("json_path", "")
+            json_field = config.get("json_field", "")
             data = response.json()
-
-            # Navigate to the target array using dot-notation path
             if json_path:
                 for key in json_path.split("."):
-                    if isinstance(data, dict):
-                        data = data.get(key, [])
-                    else:
-                        data = []
-                        break
-
+                    data = data.get(key, []) if isinstance(data, dict) else []
             if not isinstance(data, list):
-                raise ValueError(
-                    f"JSON parser: expected a list at path '{json_path}', "
-                    f"got {type(data).__name__}. Check 'json_path' config."
-                )
-
+                raise ValueError(f"JSON parser: expected list at '{json_path}', got {type(data).__name__}.")
             for item in data:
-                if isinstance(item, str):
-                    # Each element is already a plain string IOC
-                    raw = item
-                elif isinstance(item, dict):
-                    if not json_field:
-                        raise ValueError(
-                            "JSON parser: response contains objects but 'json_field' "
-                            "is not configured. Set it to the key containing the IOC value."
-                        )
-                    raw = item.get(json_field, "")
-                else:
-                    continue
-
+                raw = item if isinstance(item, str) else item.get(json_field, "") if isinstance(item, dict) else ""
+                if not json_field and isinstance(item, dict):
+                    raise ValueError("JSON parser: objects found but 'json_field' not configured.")
                 entry = build_ioc_entry(str(raw))
                 if entry:
                     ioc_batch.append(entry)
                 if len(ioc_batch) >= 1000:
-                    perform_bulk_upsert(db, ioc_batch)
-                    ioc_batch = []
+                    perform_bulk_upsert(db, ioc_batch); ioc_batch = []
 
-        # ------------------------------------------------------------------
-        # STIX2 Parser
-        # Parses STIX 2.x Bundle JSON.
-        # Extracts 'indicator' objects and decodes their 'pattern' field.
-        # No extra config required beyond url + auth.
-        # ------------------------------------------------------------------
         elif parser_type == "stix2":
             data = response.json()
-
             if data.get("type") != "bundle":
-                raise ValueError(
-                    f"STIX2 parser: expected a STIX Bundle (type='bundle'), "
-                    f"got type='{data.get('type')}'. Verify the source URL."
-                )
-
-            extracted = parse_stix2_bundle(data)
-
-            for ioc_value, ioc_type in extracted:
+                raise ValueError(f"STIX2 parser: expected bundle, got type='{data.get('type')}'.")
+            for ioc_value, ioc_type in parse_stix2_bundle(data):
                 entry = build_ioc_entry(ioc_value, forced_type=ioc_type)
                 if entry:
                     ioc_batch.append(entry)
                 if len(ioc_batch) >= 1000:
-                    perform_bulk_upsert(db, ioc_batch)
-                    ioc_batch = []
+                    perform_bulk_upsert(db, ioc_batch); ioc_batch = []
 
         else:
-            raise ValueError(
-                f"Unknown parser type '{parser_type}'. "
-                f"Supported parsers: txt, csv, json, stix2."
-            )
+            raise ValueError(f"Unknown parser '{parser_type}'. Supported: txt, csv, json, stix2.")
 
-        perform_bulk_upsert(db, ioc_batch)  # Final flush
+        perform_bulk_upsert(db, ioc_batch)
         miner.last_run = datetime.utcnow()
 
-        # Build detailed log message with type breakdown
-        total = sum(type_counts.values())
+        total         = sum(type_counts.values())
         unknown_count = type_counts.get("unknown", 0)
-        type_summary = ", ".join(f"{k}: {v}" for k, v in type_counts.items())
+        type_summary  = ", ".join(f"{k}: {v}" for k, v in type_counts.items())
         log_msg = f"Fetch completed. Total: {total} IOCs. Types: [{type_summary}]."
         if unknown_count > 0:
             log_msg += f" WARNING: {unknown_count} unclassified IOCs require manual review."
 
-        run_log.status = "success"
-        run_log.message = log_msg
+        run_log.status        = "success"
+        run_log.message       = log_msg
         run_log.iocs_processed = total
         db.commit()
 
-        # EVENT-DRIVEN CASCADE: Trigger connected Aggregators
+        # Trigger all connected Aggregators (normal + whitelist edges)
         edges_out = db.query(NodeEdge).filter(NodeEdge.source_id == miner.id).all()
         for edge in edges_out:
             agg = db.query(NodeConfig).filter(
@@ -343,14 +229,11 @@ def execute_miner(self, miner_id: int):
 
     except Exception as e:
         db.rollback()
-        err_log = (
-            db.query(NodeRunLog)
-            .filter(NodeRunLog.node_id == miner_id)
-            .order_by(NodeRunLog.id.desc())
-            .first()
-        )
+        err_log = db.query(NodeRunLog).filter(
+            NodeRunLog.node_id == miner_id
+        ).order_by(NodeRunLog.id.desc()).first()
         if err_log:
-            err_log.status = "error"
+            err_log.status  = "error"
             err_log.message = str(e)
             db.commit()
         return {"status": "error", "error": str(e)}
@@ -359,15 +242,37 @@ def execute_miner(self, miner_id: int):
 
 
 # ---------------------------------------------------------------------------
-# AGGREGATOR TASK
+# AGGREGATOR TASK  (full rewrite)
 # ---------------------------------------------------------------------------
 
 @celery_app.task(bind=True)
 def execute_aggregator(self, aggregator_id: int):
     """
-    Celery task triggered automatically by Miners (Event-Driven Chain).
-    Applies whitelist filtering, confidence override and aging (TTL) to IOCs.
-    IOCs with ioc_type='unknown' are skipped (confidence=0, excluded from feeds).
+    Full Aggregator pipeline:
+
+    1. Load config:
+         - ioc_types       (list[str])  : IOC types to process, e.g. ["domain", "ip"].
+                                          Empty list = process all types.
+         - days_to_live    (int)        : TTL in days applied to every processed IOC.
+         - confidence_override (int|None): If set, overrides confidence of all IOCs.
+
+    2. Resolve connected nodes via edges:
+         - Regular Miners  (node_type = "miner")     → source of IOCs to process.
+         - Whitelist Miners (node_type = "whitelist") → source of IOC values to exclude.
+
+    3. Build whitelist set from all Whitelist Miner IOCs.
+
+    4. Query IOCs from regular Miners:
+         - Filter by ioc_types (if configured).
+         - Exclude unknown IOCs (confidence = 0).
+
+    5. For each IOC:
+         - Skip if value is in the whitelist set.
+         - Apply confidence_override if set.
+         - Update expire_at = now + days_to_live.
+
+    6. Write detailed log with counts: processed, skipped (type filter),
+       dropped (whitelist), expired (age-out stats available via cleanup task).
     """
     db = SessionLocal()
     try:
@@ -376,70 +281,156 @@ def execute_aggregator(self, aggregator_id: int):
             return
 
         run_log = NodeRunLog(
-            node_id=aggregator_id, status="running", message="Aggregation and deduplication in progress..."
+            node_id=aggregator_id,
+            status="running",
+            message="Aggregation pipeline started..."
         )
         db.add(run_log)
         db.commit()
         db.refresh(run_log)
 
+        config               = aggregator.config
+        ioc_types            = config.get("ioc_types", [])        # e.g. ["domain", "ip"]
+        days_to_live         = int(config.get("days_to_live", 30))
+        confidence_override  = config.get("confidence_override", None)
+
+        # ── Resolve connected nodes ────────────────────────────────────────
         edges_in = db.query(NodeEdge).filter(NodeEdge.target_id == aggregator_id).all()
-        miner_ids = [edge.source_id for edge in edges_in]
+        if not edges_in:
+            run_log.status  = "error"
+            run_log.message = "Error: No nodes connected to this Aggregator."
+            db.commit()
+            return {"status": "error"}
+
+        miner_ids     = []
+        whitelist_ids = []
+
+        for edge in edges_in:
+            source = db.query(NodeConfig).filter(NodeConfig.id == edge.source_id).first()
+            if not source:
+                continue
+            if source.node_type == "whitelist":
+                whitelist_ids.append(source.id)
+            elif source.node_type == "miner":
+                miner_ids.append(source.id)
 
         if not miner_ids:
-            run_log.status = "error"
+            run_log.status  = "error"
             run_log.message = "Error: No Miner nodes connected to this Aggregator."
             db.commit()
             return {"status": "error"}
 
-        config = aggregator.config
-        confidence_override = config.get("confidence_override", None)
-        days_to_live = config.get("days_to_live", 30)
-        whitelist_domains = config.get("whitelist", [])
+        # ── Build whitelist set ────────────────────────────────────────────
+        # Load all IOC values from connected Whitelist Miners.
+        # Case-insensitive matching: store lowercase.
+        whitelist_set = set()
+        if whitelist_ids:
+            wl_iocs = db.query(IndicatorDB.value).filter(
+                IndicatorDB.source_node_id.in_(whitelist_ids)
+            ).all()
+            whitelist_set = {row.value.strip().lower() for row in wl_iocs}
 
-        # Exclude 'unknown' IOCs - they require manual reclassification first
-        iocs_to_process = db.query(IndicatorDB).filter(
+        # ── Query IOCs from regular Miners ────────────────────────────────
+        ioc_query = db.query(IndicatorDB).filter(
             IndicatorDB.source_node_id.in_(miner_ids),
             IndicatorDB.ioc_type != "unknown",
-        ).all()
+        )
 
-        processed_count = 0
-        dropped_count = 0
+        # Apply ioc_types filter (if configured)
+        if ioc_types:
+            # Validate: silently ignore invalid type strings
+            valid_filter = [t for t in ioc_types if t in VALID_IOC_TYPES]
+            if valid_filter:
+                ioc_query = ioc_query.filter(IndicatorDB.ioc_type.in_(valid_filter))
+
+        iocs_to_process = ioc_query.all()
+
+        # ── Process IOCs ──────────────────────────────────────────────────
+        processed_count    = 0
+        dropped_whitelist  = 0
+        skipped_type       = 0   # already filtered by SQL, kept for clarity
+        new_expire         = datetime.utcnow() + timedelta(days=days_to_live)
 
         for ioc in iocs_to_process:
-            if any(wl in ioc.value for wl in whitelist_domains):
-                db.delete(ioc)
-                dropped_count += 1
+            # Whitelist check (case-insensitive)
+            if ioc.value.strip().lower() in whitelist_set:
+                dropped_whitelist += 1
                 continue
-            if confidence_override:
-                ioc.confidence = confidence_override
-            ioc.expire_at = datetime.utcnow() + timedelta(days=days_to_live)
+
+            # Apply aging
+            ioc.expire_at = new_expire
+
+            # Apply confidence override
+            if confidence_override is not None:
+                ioc.confidence = int(confidence_override)
+
             processed_count += 1
 
         db.commit()
         aggregator.last_run = datetime.utcnow()
+        db.commit()
 
-        run_log.status = "success"
-        run_log.message = (
-            f"Processed {processed_count} IOCs from Miners {miner_ids}. "
-            f"Dropped (Whitelist): {dropped_count}."
+        type_filter_label = ", ".join(ioc_types) if ioc_types else "all"
+        log_msg = (
+            f"Aggregation completed. "
+            f"Types filter: [{type_filter_label}]. "
+            f"Processed: {processed_count}. "
+            f"Dropped (Whitelist): {dropped_whitelist}. "
+            f"TTL applied: {days_to_live} days."
         )
+
+        run_log.status         = "success"
+        run_log.message        = log_msg
         run_log.iocs_processed = processed_count
         db.commit()
 
-        return {"status": "success", "processed": processed_count, "dropped": dropped_count}
+        return {
+            "status":    "success",
+            "processed": processed_count,
+            "dropped":   dropped_whitelist,
+            "ttl_days":  days_to_live,
+        }
 
     except Exception as e:
         db.rollback()
-        err_log = (
-            db.query(NodeRunLog)
-            .filter(NodeRunLog.node_id == aggregator_id)
-            .order_by(NodeRunLog.id.desc())
-            .first()
-        )
+        err_log = db.query(NodeRunLog).filter(
+            NodeRunLog.node_id == aggregator_id
+        ).order_by(NodeRunLog.id.desc()).first()
         if err_log:
-            err_log.status = "error"
+            err_log.status  = "error"
             err_log.message = str(e)
             db.commit()
+        return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# AGE-OUT CLEANUP TASK
+# Runs every hour via Celery Beat.
+# Deletes all IOCs whose expire_at timestamp is in the past.
+# ---------------------------------------------------------------------------
+
+@celery_app.task
+def cleanup_expired_iocs():
+    """
+    Hourly age-out task.
+    Permanently removes all IndicatorDB rows with expire_at < now.
+    Logs a summary entry for each Aggregator whose IOCs were affected.
+    """
+    db = SessionLocal()
+    try:
+        now     = datetime.utcnow()
+        expired = db.query(IndicatorDB).filter(IndicatorDB.expire_at < now).all()
+        count   = len(expired)
+
+        for ioc in expired:
+            db.delete(ioc)
+
+        db.commit()
+        return {"status": "success", "expired_deleted": count}
+    except Exception as e:
+        db.rollback()
         return {"status": "error", "error": str(e)}
     finally:
         db.close()
@@ -452,15 +443,16 @@ def execute_aggregator(self, aggregator_id: int):
 @celery_app.task
 def master_scheduler_task():
     """
-    Master scheduler task. Runs every minute via Celery Beat.
-    Checks which active Miners are due for execution based on their polling_interval.
-    Aggregators are NOT polled here - they are triggered by Miners (Event-Driven).
+    Runs every minute via Celery Beat.
+    Triggers active Miners that are due based on polling_interval (minutes).
+    Aggregators are triggered by Miners (Event-Driven), not by this scheduler.
     """
     db = SessionLocal()
     try:
-        now = datetime.utcnow()
+        now    = datetime.utcnow()
         miners = db.query(NodeConfig).filter(
-            NodeConfig.node_type == "miner", NodeConfig.is_active == True
+            NodeConfig.node_type.in_(["miner", "whitelist"]),
+            NodeConfig.is_active == True,
         ).all()
         for miner in miners:
             polling_min = miner.config.get("polling_interval", 60)
@@ -470,11 +462,18 @@ def master_scheduler_task():
         db.close()
 
 
-# Celery Beat Schedule
+# ---------------------------------------------------------------------------
+# CELERY BEAT SCHEDULE
+# ---------------------------------------------------------------------------
+
 celery_app.conf.beat_schedule = {
     "run-master-scheduler-every-minute": {
-        "task": "app.tasks.master_scheduler_task",
+        "task":     "app.tasks.master_scheduler_task",
         "schedule": crontab(minute="*"),
+    },
+    "cleanup-expired-iocs-every-hour": {
+        "task":     "app.tasks.cleanup_expired_iocs",
+        "schedule": crontab(minute="0"),   # top of every hour
     },
 }
 celery_app.conf.timezone = "UTC"
