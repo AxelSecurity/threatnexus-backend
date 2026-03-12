@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .database import engine, Base, get_db
 from .models import NodeConfig, NodeEdge, IndicatorDB, NodeRunLog
@@ -60,10 +61,10 @@ def update_node(node_id: int, node_update: NodeCreate, db: Session = Depends(get
     db_node = db.query(NodeConfig).filter(NodeConfig.id == node_id).first()
     if not db_node:
         raise HTTPException(status_code=404, detail="Node not found")
-    db_node.name       = node_update.name
-    db_node.node_type  = node_update.node_type
-    db_node.config     = node_update.config
-    db_node.is_active  = node_update.is_active
+    db_node.name      = node_update.name
+    db_node.node_type = node_update.node_type
+    db_node.config    = node_update.config
+    db_node.is_active = node_update.is_active
     db.commit()
     db.refresh(db_node)
     return db_node
@@ -202,14 +203,16 @@ def _get_whitelist_node(node_id: int, db: Session) -> NodeConfig:
 
 class WhitelistAddRequest(BaseModel):
     value: str
-    ioc_type: Optional[str] = None  # If omitted, auto-detected
+    ioc_type: Optional[str] = None
 
 
 @app.post("/api/v1/nodes/{node_id}/whitelist/add")
 def whitelist_add_ioc(node_id: int, payload: WhitelistAddRequest, db: Session = Depends(get_db)):
     """
     Manually add a single IOC to a Whitelist Miner.
-    If ioc_type is not provided, it is auto-detected via detect_ioc_type().
+    Deduplication key: (value, source_node_id).
+    The same value can exist in a regular Miner without conflict.
+    Filtering happens at aggregator/feed level — Miner data is never modified.
     """
     node  = _get_whitelist_node(node_id, db)
     value = payload.value.strip()
@@ -218,9 +221,9 @@ def whitelist_add_ioc(node_id: int, payload: WhitelistAddRequest, db: Session = 
 
     ioc_type = payload.ioc_type if payload.ioc_type in VALID_IOC_TYPES else detect_ioc_type(value)
 
-    # Check for duplicate
+    # Check duplicate within THIS whitelist only
     existing = db.query(IndicatorDB).filter(
-        IndicatorDB.value == value,
+        IndicatorDB.value          == value,
         IndicatorDB.source_node_id == node_id,
     ).first()
     if existing:
@@ -229,8 +232,8 @@ def whitelist_add_ioc(node_id: int, payload: WhitelistAddRequest, db: Session = 
     ioc = IndicatorDB(
         value          = value,
         ioc_type       = ioc_type,
-        confidence     = 100,           # Whitelist entries always have max confidence
-        expire_at      = datetime.utcnow() + timedelta(days=3650),  # 10 years — effectively permanent
+        confidence     = 100,
+        expire_at      = datetime.utcnow() + timedelta(days=3650),
         source_node_id = node_id,
         last_seen      = datetime.utcnow(),
     )
@@ -243,38 +246,39 @@ def whitelist_add_ioc(node_id: int, payload: WhitelistAddRequest, db: Session = 
 @app.post("/api/v1/nodes/{node_id}/whitelist/upload")
 async def whitelist_upload_file(node_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
-    Upload a plain-text file (.txt) to bulk-add IOCs to a Whitelist Miner.
-    Format: one IOC per line. Lines starting with # or // are skipped.
-    IOC type is auto-detected for each entry.
-    Duplicate values (already in this whitelist) are silently skipped.
-    Returns a summary of added vs skipped entries.
+    Bulk-add IOCs from a .txt file to a Whitelist Miner.
+    One IOC per line. Lines starting with # or // are skipped.
+    Deduplication key: (value, source_node_id) via ON CONFLICT DO UPDATE.
+    Values already in other Miner nodes are NOT affected.
     """
     node = _get_whitelist_node(node_id, db)
 
     if not file.filename.endswith(".txt"):
         raise HTTPException(status_code=400, detail="Only .txt files are supported.")
 
-    content  = await file.read()
-    lines    = content.decode("utf-8", errors="ignore").splitlines()
-
-    # Load existing values for this whitelist to detect duplicates efficiently
-    existing_values = {
-        row.value for row in db.query(IndicatorDB.value)
-        .filter(IndicatorDB.source_node_id == node_id).all()
-    }
+    content = await file.read()
+    lines   = content.decode("utf-8", errors="ignore").splitlines()
 
     added   = 0
     skipped = 0
     invalid = 0
     batch   = []
+    seen_in_file = set()
     expire  = datetime.utcnow() + timedelta(days=3650)
     now     = datetime.utcnow()
+
+    # Load existing values in this whitelist for fast duplicate check
+    owned_values = {
+        row.value for row in
+        db.query(IndicatorDB.value)
+        .filter(IndicatorDB.source_node_id == node_id).all()
+    }
 
     for line in lines:
         value = line.strip()
         if not value or value.startswith("#") or value.startswith("//"):
             continue
-        if value in existing_values:
+        if value in owned_values or value in seen_in_file:
             skipped += 1
             continue
 
@@ -291,16 +295,26 @@ async def whitelist_upload_file(node_id: int, file: UploadFile = File(...), db: 
             "source_node_id": node_id,
             "last_seen":      now,
         })
-        existing_values.add(value)  # Prevent intra-file duplicates
+        seen_in_file.add(value)
         added += 1
 
         if len(batch) >= 1000:
-            db.bulk_insert_mappings(IndicatorDB, batch)
+            stmt = pg_insert(IndicatorDB).values(batch)
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_indicator_value_per_node",
+                set_={"last_seen": stmt.excluded.last_seen},
+            )
+            db.execute(stmt)
             db.commit()
             batch = []
 
     if batch:
-        db.bulk_insert_mappings(IndicatorDB, batch)
+        stmt = pg_insert(IndicatorDB).values(batch)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_indicator_value_per_node",
+            set_={"last_seen": stmt.excluded.last_seen},
+        )
+        db.execute(stmt)
         db.commit()
 
     return {
@@ -313,12 +327,10 @@ async def whitelist_upload_file(node_id: int, file: UploadFile = File(...), db: 
 
 @app.delete("/api/v1/nodes/{node_id}/whitelist/{ioc_id}")
 def whitelist_delete_ioc(node_id: int, ioc_id: int, db: Session = Depends(get_db)):
-    """
-    Remove a single IOC from a Whitelist Miner by its ID.
-    """
+    """Remove a single IOC from a Whitelist Miner by its ID."""
     _get_whitelist_node(node_id, db)
     ioc = db.query(IndicatorDB).filter(
-        IndicatorDB.id == ioc_id,
+        IndicatorDB.id             == ioc_id,
         IndicatorDB.source_node_id == node_id,
     ).first()
     if not ioc:
@@ -329,7 +341,7 @@ def whitelist_delete_ioc(node_id: int, ioc_id: int, db: Session = Depends(get_db
 
 
 # ---------------------------------------------------------------------------
-# MANUAL TRIGGER (Miners only)
+# MANUAL TRIGGER
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/nodes/{node_id}/trigger")
@@ -350,13 +362,12 @@ def trigger_miner_manually(node_id: int, db: Session = Depends(get_db)):
 @app.get("/feeds/{output_name}/{format}", response_class=PlainTextResponse)
 def get_dynamic_feed(output_name: str, format: str, db: Session = Depends(get_db)):
     """
-    Retrieves active IOCs for a named Output node.
-    Graph traversal: Output <- Aggregator <- Miners.
-    Excludes whitelist nodes, unknown IOCs, expired IOCs, and low-confidence IOCs.
-    Supports 'txt' and 'json' formats.
+    Graph traversal: Output <- Aggregator <- Miners (+Whitelist Miners).
+    Whitelist IOCs are applied as an exclusion set at read time.
+    Miner data is NEVER modified.
     """
     output_node = db.query(NodeConfig).filter(
-        NodeConfig.name == output_name,
+        NodeConfig.name      == output_name,
         NodeConfig.node_type == "output",
     ).first()
     if not output_node:
@@ -372,44 +383,38 @@ def get_dynamic_feed(output_name: str, format: str, db: Session = Depends(get_db
 
     edges_to_agg = db.query(NodeEdge).filter(NodeEdge.target_id == aggregator.id).all()
 
-    # Only include regular miner nodes, not whitelist nodes
-    miner_ids = [
-        edge.source_id for edge in edges_to_agg
-        if db.query(NodeConfig.node_type)
-           .filter(NodeConfig.id == edge.source_id)
-           .scalar() == "miner"
-    ]
+    source_nodes = {
+        edge.source_id: db.query(NodeConfig.node_type)
+            .filter(NodeConfig.id == edge.source_id).scalar()
+        for edge in edges_to_agg
+    }
+
+    miner_ids     = [nid for nid, ntype in source_nodes.items() if ntype == "miner"]
+    whitelist_ids = [nid for nid, ntype in source_nodes.items() if ntype == "whitelist"]
 
     if not miner_ids:
         return "" if format == "txt" else "[]"
 
-    min_confidence  = aggregator.config.get("confidence_override", 50)
+    min_confidence   = aggregator.config.get("confidence_override", 50)
     ioc_types_filter = aggregator.config.get("ioc_types", [])
 
     ioc_query = db.query(IndicatorDB).filter(
         IndicatorDB.source_node_id.in_(miner_ids),
         IndicatorDB.ioc_type != "unknown",
         IndicatorDB.confidence >= min_confidence,
-        IndicatorDB.expire_at > datetime.utcnow(),
+        IndicatorDB.expire_at  > datetime.utcnow(),
     )
-
     if ioc_types_filter:
         ioc_query = ioc_query.filter(IndicatorDB.ioc_type.in_(ioc_types_filter))
 
     active_iocs = ioc_query.all()
 
-    # Apply whitelist exclusion at feed level too
-    whitelist_ids = [
-        edge.source_id for edge in edges_to_agg
-        if db.query(NodeConfig.node_type)
-           .filter(NodeConfig.id == edge.source_id)
-           .scalar() == "whitelist"
-    ]
+    # Build whitelist exclusion set — read-only, Miner rows never touched
     whitelist_set = set()
     if whitelist_ids:
         whitelist_set = {
-            row.value.strip().lower()
-            for row in db.query(IndicatorDB.value)
+            row.value.strip().lower() for row in
+            db.query(IndicatorDB.value)
             .filter(IndicatorDB.source_node_id.in_(whitelist_ids)).all()
         }
 
